@@ -1,0 +1,109 @@
+#!/bin/sh
+_=[[
+exec nvim --clean --headless -l "$0" "$@"
+]]
+-- A fake `thought` CLI for the plugin tests: a shell script that re-runs itself
+-- as Lua under `nvim -l`. It keeps each thought as $FAKE_THOUGHT_DIR/<id>.json
+-- ({title, body, version}) and appends every call ({argv, stdin}) to
+-- $FAKE_THOUGHT_DIR/calls.jsonl. It implements only the verbs the plugin uses.
+-- Like the real CLI, it reports a problem as problem+json on stderr under
+-- --json, and as `thought: <title>: <detail>` otherwise. If
+-- $FAKE_THOUGHT_DIR/fail.json ({code, stderr}) exists, every call writes that
+-- stderr verbatim and exits with that code instead.
+
+local dir = assert(os.getenv("FAKE_THOUGHT_DIR"), "FAKE_THOUGHT_DIR is not set")
+
+local function readfile(path)
+  local f = io.open(path, "rb")
+  if not f then return nil end
+  local data = f:read("a")
+  f:close()
+  return data
+end
+
+local function writefile(path, data, mode)
+  local f = assert(io.open(path, mode or "wb"))
+  f:write(data)
+  f:close()
+end
+
+local function thought_path(id) return dir .. "/" .. id .. ".json" end
+
+local function load(id)
+  local data = readfile(thought_path(id))
+  return data and vim.json.decode(data)
+end
+
+local function save(id, thought) writefile(thought_path(id), vim.json.encode(thought)) end
+
+local argv = {}
+for i = 1, #arg do argv[i] = arg[i] end
+
+local function fail(code, msg)
+  io.stderr:write("thought: " .. msg .. "\n")
+  os.exit(code)
+end
+
+--- Reports the problem {title, status, detail?, ...} and exits with code.
+local function problem(code, p)
+  if vim.tbl_contains(argv, "--json") then
+    io.stderr:write(vim.json.encode(p))
+  else
+    io.stderr:write("thought: " .. p.title .. (p.detail and ": " .. p.detail or "") .. "\n")
+  end
+  os.exit(code)
+end
+
+local function not_found(id)
+  problem(3, { title = "Not Found", status = 404, detail = "thought " .. id .. " not found" })
+end
+
+local verb = argv[1]
+local stdin = verb == "write" and io.read("a") or nil
+writefile(dir .. "/calls.jsonl", vim.json.encode({ argv = argv, stdin = stdin }) .. "\n", "ab")
+
+local scripted = readfile(dir .. "/fail.json")
+if scripted then
+  local f = vim.json.decode(scripted)
+  io.stderr:write(f.stderr)
+  os.exit(f.code)
+end
+
+if verb == "show" then
+  -- show --json <id>
+  local id = tonumber(argv[3])
+  local thought = load(id) or not_found(argv[3])
+  io.stdout:write(vim.json.encode({
+    id = id,
+    title = thought.title,
+    tags = {},
+    attributes = { status = "raw" },
+    body = thought.body,
+    version = thought.version,
+  }) .. "\n")
+elseif verb == "write" then
+  -- write <id> --version <n> --json
+  local id, version = tonumber(argv[2]), tonumber(argv[4])
+  local thought = load(id) or not_found(argv[2])
+  if version ~= thought.version then
+    problem(4, {
+      title = "Precondition Failed",
+      status = 412,
+      detail = "stale version, current is " .. thought.version,
+      current_version = thought.version,
+    })
+  end
+  if stdin ~= thought.body then
+    thought.body, thought.version = stdin, thought.version + 1
+    save(id, thought)
+  end
+  io.stdout:write(vim.json.encode({ id = id, version = thought.version }) .. "\n")
+elseif verb == "add" then
+  -- add -- <title>
+  local id = 1
+  while load(id) do id = id + 1 end
+  save(id, { title = argv[#argv], body = "", version = 1 })
+  io.stdout:write(id .. "\n")
+else
+  fail(2, "the fake does not know " .. tostring(verb))
+end
